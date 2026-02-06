@@ -1,0 +1,13 @@
+10 PRINT "Hello, Tiny BASIC!"
+20 LET A = 5
+30 LET B = 10
+40 PRINT "A = ", A, " B = ", B
+50 LET C = A + B
+60 PRINT "A + B = ", C
+70 LET I = 1
+80 IF I > 5 THEN 120
+90 PRINT "Loop: ", I
+100 LET I = I + 1
+110 GOTO 80
+120 PRINT "Done!"
+130 END
