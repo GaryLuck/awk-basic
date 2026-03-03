@@ -2,12 +2,11 @@
 # Tiny BASIC Interpreter in AWK
 
 BEGIN {
-    # Initialize variables A-Z to 0
-    for (i = 65; i <= 90; i++)
-        vars[sprintf("%c", i)] = 0
-
-    # Program storage: prog[linenum] = "source line"
-    # line_nums[] sorted array of line numbers
+    # Initialize numeric variables A-Z to 0, string variables A$-Z$ to ""
+    for (i = 65; i <= 90; i++) {
+        vars[sprintf("%c", i)]  = 0
+        svars[sprintf("%c", i)] = ""
+    }
 
     interactive = 1
     printf "Tiny BASIC Interpreter\n"
@@ -48,8 +47,11 @@ BEGIN {
     } else if (cmd == "NEW") {
         delete prog
         delete vars
-        for (i = 65; i <= 90; i++)
-            vars[sprintf("%c", i)] = 0
+        delete svars
+        for (i = 65; i <= 90; i++) {
+            vars[sprintf("%c", i)]  = 0
+            svars[sprintf("%c", i)] = ""
+        }
         delete arrays
         delete arr_size
         printf "OK\n> "
@@ -61,7 +63,8 @@ BEGIN {
         printf "> "
     } else if (cmd == "HELP") {
         printf "Commands: NEW, LIST, RUN, LOAD filename, SAVE filename, QUIT\n"
-        printf "Statements: PRINT, LET, GOTO, IF..THEN, END, DIM\n"
+        printf "Statements: PRINT, LET, INPUT, GOTO, IF..THEN, END, DIM, REM\n"
+        printf "Numeric vars: A-Z    String vars: A$-Z$\n"
         printf "Enter lines with a line number to add to program.\n"
         printf "Enter a line number alone to delete that line.\n"
         printf "> "
@@ -116,8 +119,10 @@ function do_load(fname,    linetext, linenum, rest) {
 
 function do_run(    n, i, sorted, pc, stmt, err) {
     # Reset variables
-    for (i = 65; i <= 90; i++)
-        vars[sprintf("%c", i)] = 0
+    for (i = 65; i <= 90; i++) {
+        vars[sprintf("%c", i)]  = 0
+        svars[sprintf("%c", i)] = ""
+    }
     delete arrays
 
     n = sort_line_nums(sorted)
@@ -155,10 +160,10 @@ function do_run(    n, i, sorted, pc, stmt, err) {
 
 # Execute a single statement. Returns "" on success, error message on failure.
 # Returns "END" for END statement, "GOTO" for GOTO (sets goto_target).
-function exec_stmt(stmt,    cmd, rest, urest) {
+function exec_stmt(stmt,    cmd, rest) {
     gsub(/^[ \t]+/, "", stmt)
 
-    # Extract first word
+    # Extract first keyword
     if (match(stmt, /^[A-Za-z]+/)) {
         cmd = toupper(substr(stmt, RSTART, RLENGTH))
         rest = substr(stmt, RSTART + RLENGTH)
@@ -168,26 +173,31 @@ function exec_stmt(stmt,    cmd, rest, urest) {
     }
 
     if (cmd == "PRINT") return do_print(rest)
-    if (cmd == "LET") return do_let(rest)
-    if (cmd == "GOTO") return do_goto(rest)
-    if (cmd == "IF") return do_if(rest)
-    if (cmd == "END") return "END"
-    if (cmd == "DIM") return do_dim(rest)
-    if (cmd == "REM") return ""
+    if (cmd == "LET")   return do_let(rest)
+    if (cmd == "INPUT") return do_input(rest)
+    if (cmd == "GOTO")  return do_goto(rest)
+    if (cmd == "IF")    return do_if(rest)
+    if (cmd == "END")   return "END"
+    if (cmd == "DIM")   return do_dim(rest)
+    if (cmd == "REM")   return ""
 
     return "Unknown command: " cmd
 }
 
-function do_print(rest,    out, val, ch, in_str, str_val, expr, need_newline) {
+# ---------------------------------------------------------------------------
+# PRINT  –  handles string literals, string variables (A$), numeric exprs,
+#           comma (separator) and semicolon (suppress newline).
+# ---------------------------------------------------------------------------
+function do_print(rest,    val, ch, str_val, vname, need_newline) {
     need_newline = 1
-    rest = rest  # remaining to parse
     while (rest != "") {
         gsub(/^[ \t]+/, "", rest)
         if (rest == "") break
 
         ch = substr(rest, 1, 1)
+
         if (ch == "\"") {
-            # String literal
+            # ---- string literal ----
             rest = substr(rest, 2)
             str_val = ""
             while (rest != "") {
@@ -197,16 +207,26 @@ function do_print(rest,    out, val, ch, in_str, str_val, expr, need_newline) {
                 str_val = str_val ch
             }
             printf "%s", str_val
+
         } else if (ch == ",") {
             rest = substr(rest, 2)
             continue
+
         } else if (ch == ";") {
             rest = substr(rest, 2)
             need_newline = 0
             continue
+
+        } else if ((ch >= "A" && ch <= "Z" || ch >= "a" && ch <= "z") &&
+                   substr(rest, 2, 1) == "$") {
+            # ---- string variable (e.g. A$) ----
+            vname = toupper(ch)
+            rest  = substr(rest, 3)
+            printf "%s", svars[vname]
+
         } else {
-            # Expression
-            val = parse_expr(rest)
+            # ---- numeric expression ----
+            val  = parse_expr(rest)
             rest = _rest
             printf "%d", val
         }
@@ -216,7 +236,12 @@ function do_print(rest,    out, val, ch, in_str, str_val, expr, need_newline) {
     return ""
 }
 
-function do_let(rest,    vname, idx, val) {
+# ---------------------------------------------------------------------------
+# LET  –  numeric:  LET A  = <expr>
+#          array:   LET A(i) = <expr>
+#          string:  LET A$ = "<literal>" | B$
+# ---------------------------------------------------------------------------
+function do_let(rest,    vname, idx, val, sval) {
     gsub(/^[ \t]+/, "", rest)
     vname = toupper(substr(rest, 1, 1))
 
@@ -225,10 +250,22 @@ function do_let(rest,    vname, idx, val) {
     rest = substr(rest, 2)
     gsub(/^[ \t]+/, "", rest)
 
-    # Check for array index
+    # ---- string variable ----
+    if (substr(rest, 1, 1) == "$") {
+        rest = substr(rest, 2)
+        gsub(/^[ \t]+/, "", rest)
+        if (substr(rest, 1, 1) != "=") return "Missing ="
+        rest = substr(rest, 2)
+        gsub(/^[ \t]+/, "", rest)
+        sval = parse_string_expr(rest)
+        svars[vname] = sval
+        return ""
+    }
+
+    # ---- array element ----
     if (substr(rest, 1, 1) == "(") {
         rest = substr(rest, 2)
-        idx = parse_expr(rest)
+        idx  = parse_expr(rest)
         rest = _rest
         gsub(/^[ \t]+/, "", rest)
         if (substr(rest, 1, 1) != ")") return "Missing )"
@@ -236,16 +273,112 @@ function do_let(rest,    vname, idx, val) {
         gsub(/^[ \t]+/, "", rest)
         if (substr(rest, 1, 1) != "=") return "Missing ="
         rest = substr(rest, 2)
-        val = parse_expr(rest)
+        val  = parse_expr(rest)
         arrays[vname, idx] = val
         return ""
     }
 
+    # ---- numeric variable ----
     if (substr(rest, 1, 1) != "=") return "Missing ="
     rest = substr(rest, 2)
-
-    val = parse_expr(rest)
+    val  = parse_expr(rest)
     vars[vname] = int(val)
+    return ""
+}
+
+# ---------------------------------------------------------------------------
+# INPUT  –  reads a value from the user.
+#   Syntax:  INPUT [<"prompt">,] varname[$]
+#   Examples:
+#     INPUT A
+#     INPUT A$
+#     INPUT "Enter name: ", N$
+#     INPUT "Enter age: ", A
+# ---------------------------------------------------------------------------
+function do_input(rest,    prompt, ch, vname, sval, val) {
+    gsub(/^[ \t]+/, "", rest)
+
+    # Default prompt
+    prompt = "? "
+
+    # Optional quoted prompt string
+    if (substr(rest, 1, 1) == "\"") {
+        rest   = substr(rest, 2)
+        prompt = ""
+        while (rest != "") {
+            ch   = substr(rest, 1, 1)
+            rest = substr(rest, 2)
+            if (ch == "\"") break
+            prompt = prompt ch
+        }
+        gsub(/^[ \t]+/, "", rest)
+        # Skip optional comma or semicolon between prompt and variable
+        if (substr(rest, 1, 1) == "," || substr(rest, 1, 1) == ";") {
+            rest = substr(rest, 2)
+        }
+        gsub(/^[ \t]+/, "", rest)
+    }
+
+    # Variable name (single letter)
+    if (rest == "") return "Missing variable"
+    vname = toupper(substr(rest, 1, 1))
+    if (vname < "A" || vname > "Z") return "Invalid variable name"
+    rest = substr(rest, 2)
+    gsub(/^[ \t]+/, "", rest)
+
+    # ---- string variable ----
+    if (substr(rest, 1, 1) == "$") {
+        printf "%s", prompt
+        if ((getline sval) <= 0) sval = ""
+        svars[vname] = sval
+        return ""
+    }
+
+    # ---- numeric variable ----
+    printf "%s", prompt
+    if ((getline val) <= 0) val = 0
+    vars[vname] = int(val + 0)
+    return ""
+}
+
+# ---------------------------------------------------------------------------
+# parse_string_expr  –  parses the RHS of a string assignment.
+#   Handles:  "literal"   or   B$
+#   Sets _rest to whatever follows the parsed token.
+# ---------------------------------------------------------------------------
+function parse_string_expr(s,    ch, sval, vname) {
+    gsub(/^[ \t]+/, "", s)
+    ch = substr(s, 1, 1)
+
+    # String literal
+    if (ch == "\"") {
+        s    = substr(s, 2)
+        sval = ""
+        while (s != "") {
+            ch = substr(s, 1, 1)
+            s  = substr(s, 2)
+            if (ch == "\"") break
+            sval = sval ch
+        }
+        _rest = s
+        return sval
+    }
+
+    # String variable reference (e.g. B$)
+    if ((ch >= "A" && ch <= "Z") || (ch >= "a" && ch <= "z")) {
+        vname = toupper(ch)
+        s = substr(s, 2)
+        if (substr(s, 1, 1) == "$") {
+            s = substr(s, 2)
+            _rest = s
+            return svars[vname]
+        }
+        # Treat as bare letter – put it back and return empty
+        _rest = ch s
+        return ""
+    }
+
+    _rest = s
     return ""
 }
 
@@ -255,10 +388,7 @@ function do_goto(rest,    val) {
     return "GOTO"
 }
 
-function do_if(rest,    val, pos, then_part) {
-    # IF expr THEN stmt
-    # Parse the conditional expression up to THEN
-    # We need to find THEN keyword
+function do_if(rest,    val, pos, cond_part, then_part) {
     pos = find_then(rest)
     if (pos == 0) return "Missing THEN"
 
@@ -269,7 +399,7 @@ function do_if(rest,    val, pos, then_part) {
     val = parse_expr(cond_part)
 
     if (val != 0) {
-        # Check if THEN is followed by a line number (implicit GOTO)
+        # THEN followed by a bare line number -> implicit GOTO
         if (match(then_part, /^[0-9]+$/)) {
             goto_target = int(then_part)
             return "GOTO"
@@ -281,12 +411,11 @@ function do_if(rest,    val, pos, then_part) {
 
 function find_then(s,    i, upr) {
     upr = toupper(s)
-    i = index(upr, "THEN")
-    if (i > 0) return i
-    return 0
+    i   = index(upr, "THEN")
+    return (i > 0) ? i : 0
 }
 
-function do_dim(rest,    vname, size) {
+function do_dim(rest,    vname, size, i) {
     gsub(/^[ \t]+/, "", rest)
     vname = toupper(substr(rest, 1, 1))
     if (vname < "A" || vname > "Z") return "Invalid array name"
@@ -299,7 +428,6 @@ function do_dim(rest,    vname, size) {
     gsub(/^[ \t]+/, "", rest)
     if (substr(rest, 1, 1) != ")") return "Missing )"
     arr_size[vname] = int(size)
-    # Initialize array elements to 0
     for (i = 0; i < size; i++)
         arrays[vname, i] = 0
     return ""
@@ -308,49 +436,38 @@ function do_dim(rest,    vname, size) {
 # ---- Expression Parser (recursive descent) ----
 # Uses global _rest to return remaining input after parsing.
 
-# Entry: parse_expr -> handles comparisons
 function parse_expr(s,    left, op, right) {
     gsub(/^[ \t]+/, "", s)
     left = parse_add(s)
-    s = _rest
+    s    = _rest
     gsub(/^[ \t]+/, "", s)
 
-    # Comparison operators
     while (1) {
         if (substr(s, 1, 2) == "<>") {
-            s = substr(s, 3); left = parse_add(s); right = left; left = (left != right) ? 1 : 0
-            # Redo: we need the previous left
-            break
-        }
-        op = substr(s, 1, 1)
-        if (op == "=") {
-            s = substr(s, 2)
+            op    = "<>"
+            s     = substr(s, 3)
             right = parse_add(s); s = _rest
-            left = (left == right) ? 1 : 0
-        } else if (op == "<") {
-            if (substr(s, 2, 1) == "=") {
-                s = substr(s, 3)
-                right = parse_add(s); s = _rest
-                left = (left <= right) ? 1 : 0
-            } else if (substr(s, 2, 1) == ">") {
-                s = substr(s, 3)
-                right = parse_add(s); s = _rest
-                left = (left != right) ? 1 : 0
-            } else {
-                s = substr(s, 2)
-                right = parse_add(s); s = _rest
-                left = (left < right) ? 1 : 0
-            }
-        } else if (op == ">") {
-            if (substr(s, 2, 1) == "=") {
-                s = substr(s, 3)
-                right = parse_add(s); s = _rest
-                left = (left >= right) ? 1 : 0
-            } else {
-                s = substr(s, 2)
-                right = parse_add(s); s = _rest
-                left = (left > right) ? 1 : 0
-            }
+            left  = (left != right) ? 1 : 0
+        } else if (substr(s, 1, 2) == "<=") {
+            s     = substr(s, 3)
+            right = parse_add(s); s = _rest
+            left  = (left <= right) ? 1 : 0
+        } else if (substr(s, 1, 2) == ">=") {
+            s     = substr(s, 3)
+            right = parse_add(s); s = _rest
+            left  = (left >= right) ? 1 : 0
+        } else if (substr(s, 1, 1) == "=") {
+            s     = substr(s, 2)
+            right = parse_add(s); s = _rest
+            left  = (left == right) ? 1 : 0
+        } else if (substr(s, 1, 1) == "<") {
+            s     = substr(s, 2)
+            right = parse_add(s); s = _rest
+            left  = (left < right) ? 1 : 0
+        } else if (substr(s, 1, 1) == ">") {
+            s     = substr(s, 2)
+            right = parse_add(s); s = _rest
+            left  = (left > right) ? 1 : 0
         } else {
             break
         }
@@ -360,19 +477,17 @@ function parse_expr(s,    left, op, right) {
     return int(left)
 }
 
-function parse_add(s,    left, op) {
+function parse_add(s,    left, op, right) {
     gsub(/^[ \t]+/, "", s)
     left = parse_mul(s)
-    s = _rest
+    s    = _rest
     gsub(/^[ \t]+/, "", s)
 
     while (substr(s, 1, 1) == "+" || substr(s, 1, 1) == "-") {
-        op = substr(s, 1, 1)
-        s = substr(s, 2)
-        right = parse_mul(s)
-        s = _rest
-        if (op == "+") left = left + right
-        else left = left - right
+        op    = substr(s, 1, 1)
+        s     = substr(s, 2)
+        right = parse_mul(s); s = _rest
+        left  = (op == "+") ? left + right : left - right
         gsub(/^[ \t]+/, "", s)
     }
     _rest = s
@@ -382,16 +497,16 @@ function parse_add(s,    left, op) {
 function parse_mul(s,    left, op, right) {
     gsub(/^[ \t]+/, "", s)
     left = parse_unary(s)
-    s = _rest
+    s    = _rest
     gsub(/^[ \t]+/, "", s)
 
     while (substr(s, 1, 1) == "*" || substr(s, 1, 1) == "/" || substr(s, 1, 1) == "%") {
-        op = substr(s, 1, 1)
-        s = substr(s, 2)
-        right = parse_unary(s)
-        s = _rest
-        if (op == "*") left = left * right
-        else if (op == "/") {
+        op    = substr(s, 1, 1)
+        s     = substr(s, 2)
+        right = parse_unary(s); s = _rest
+        if (op == "*") {
+            left = left * right
+        } else if (op == "/") {
             if (right == 0) { printf "Division by zero\n"; left = 0 }
             else left = int(left / right)
         } else {
@@ -404,18 +519,15 @@ function parse_mul(s,    left, op, right) {
     return left
 }
 
-function parse_unary(s,    ch) {
+function parse_unary(s,    ch, val) {
     gsub(/^[ \t]+/, "", s)
     ch = substr(s, 1, 1)
     if (ch == "-") {
-        s = substr(s, 2)
+        s   = substr(s, 2)
         val = parse_atom(s)
-        _rest = _rest
         return -val
     }
-    if (ch == "+") {
-        s = substr(s, 2)
-    }
+    if (ch == "+") s = substr(s, 2)
     return parse_atom(s)
 }
 
@@ -428,8 +540,8 @@ function parse_atom(s,    ch, num, vname, idx) {
         num = 0
         while (ch >= "0" && ch <= "9") {
             num = num * 10 + (ch + 0)
-            s = substr(s, 2)
-            ch = substr(s, 1, 1)
+            s   = substr(s, 2)
+            ch  = substr(s, 1, 1)
         }
         _rest = s
         return int(num)
@@ -437,9 +549,9 @@ function parse_atom(s,    ch, num, vname, idx) {
 
     # Parenthesized expression
     if (ch == "(") {
-        s = substr(s, 2)
+        s   = substr(s, 2)
         val = parse_expr(s)
-        s = _rest
+        s   = _rest
         gsub(/^[ \t]+/, "", s)
         if (substr(s, 1, 1) == ")") s = substr(s, 2)
         _rest = s
@@ -449,13 +561,13 @@ function parse_atom(s,    ch, num, vname, idx) {
     # Variable or array access
     if ((ch >= "A" && ch <= "Z") || (ch >= "a" && ch <= "z")) {
         vname = toupper(ch)
-        s = substr(s, 2)
+        s     = substr(s, 2)
         gsub(/^[ \t]+/, "", s)
-        # Check for array access
+        # Array element
         if (substr(s, 1, 1) == "(") {
-            s = substr(s, 2)
+            s   = substr(s, 2)
             idx = parse_expr(s)
-            s = _rest
+            s   = _rest
             gsub(/^[ \t]+/, "", s)
             if (substr(s, 1, 1) == ")") s = substr(s, 2)
             _rest = s
@@ -465,7 +577,7 @@ function parse_atom(s,    ch, num, vname, idx) {
         return int(vars[vname])
     }
 
-    # Unknown token - return 0
+    # Unknown token – return 0
     _rest = s
     return 0
 }
@@ -477,10 +589,10 @@ function sort_line_nums(sorted,    n, i, j, tmp, k) {
         n++
         sorted[n] = k + 0
     }
-    # Simple insertion sort
+    # Insertion sort
     for (i = 2; i <= n; i++) {
         tmp = sorted[i]
-        j = i - 1
+        j   = i - 1
         while (j >= 1 && sorted[j] > tmp) {
             sorted[j + 1] = sorted[j]
             j--
